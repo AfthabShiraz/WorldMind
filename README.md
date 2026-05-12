@@ -42,18 +42,44 @@ This is **not** the stack the plan pins (the plan assumes amd64 + the official N
 
 ## Quickstart
 
-```bash
-# Phase 0 — one-time. Idempotent; safe to re-run.
-make install      # installs miniforge + env at ~/miniforge3
-make env-check    # proves GPU + torch + gsplat + colmap + nerfstudio all work on this box
+**One-time setup** (idempotent — safe to re-run):
 
-# Per scene, drop the input video then run the wrappers in order.
-cp ~/some_video.mp4 data/raw/living_room.mp4
-make process-data SCENE=living_room   # Phase 1+2: frames + COLMAP poses
-make train-smoke  SCENE=living_room   # Phase 4: 5k-iter smoke; exports a .ply
-# Inspect outputs/living_room/*.ply in https://playcanvas.com/supersplat — Phase 4 viewer probe.
-make train-full   SCENE=living_room   # Phase 5: full ~30k-iter production run
-make export-splat SCENE=living_room   # Phase 6: final submission .ply
+```bash
+make install      # installs miniforge + env at ~/miniforge3
+make env-check    # proves GPU + torch + gsplat + colmap + nerfstudio all work
+```
+
+**Then for any video, one command:**
+
+```bash
+make run VIDEO=~/some_clip.mp4              # ~10 min on Blackwell — produces .ply
+# or:
+bash scripts/run.sh ~/some_clip.mp4         # same, without make
+```
+
+That's it. The script copies your video into `data/raw/`, derives a scene name from the filename, runs frame extraction + COLMAP + splatfacto training + .ply export, and drops the result at:
+
+```
+outputs/<scene_id>/ply_full/splat.ply        ← drag into https://playcanvas.com/supersplat
+outputs/<scene_id>/_qc/renders_full/         ← 6 preview JPGs (look here over SSH)
+```
+
+**Useful options:**
+
+```bash
+make run VIDEO=~/clip.mp4 SCENE=living_room              # custom scene name
+make run VIDEO=~/clip.mp4 PROFILE=smoke                  # 5k-iter smoke (~1 min) instead of full ~10 min
+make run VIDEO=~/clip.mp4 EXTRA="--focal-length 750"     # override focal length (default ≈ 70° HFoV)
+```
+
+**Per-phase invocations** (useful for debugging, iterating, re-running just one stage):
+
+```bash
+make process-data-manual SCENE=room EXTRA=--force        # only frames + COLMAP
+make qc-process-data    SCENE=room                       # exit-criteria checks
+make train-full         SCENE=room                       # only training
+make export-splat       SCENE=room EXTRA="--profile full"
+make clean-scene        SCENE=room                       # wipe derived artifacts (keeps the input video)
 ```
 
 ## Phase status

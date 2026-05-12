@@ -13,10 +13,17 @@ SCENE ?=
 require-scene:
 	@test -n "$(SCENE)" || { echo "ERROR: SCENE= is required (e.g. make $(MAKECMDGOALS) SCENE=living_room)"; exit 2; }
 
-.PHONY: help install env-check process-data train-smoke train-full export-splat lift-semantics clean-scene require-scene
+.PHONY: help install env-check run process-data process-data-manual qc-process-data train-smoke train-full export-splat lift-semantics clean-scene require-scene require-video
 
 help:  ## list targets
-	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+VIDEO ?=
+require-video:
+	@test -n "$(VIDEO)" || { echo "ERROR: VIDEO= is required. e.g.  make run VIDEO=~/myclip.mp4"; exit 2; }
+
+run: require-video ## ONE-SHOT: video -> .ply. Usage: make run VIDEO=/path/to/clip.mp4 [SCENE=name] [PROFILE=full|smoke]
+	bash scripts/run.sh --video "$(VIDEO)" $(if $(SCENE),--scene "$(SCENE)") $(if $(PROFILE),--profile "$(PROFILE)") $(EXTRA)
 
 install: ## Phase 0: install miniforge + conda env + torch + nerfstudio (idempotent)
 	bash scripts/install_env.sh
@@ -24,11 +31,11 @@ install: ## Phase 0: install miniforge + conda env + torch + nerfstudio (idempot
 env-check: ## Phase 0 gate: prove the env works end-to-end on the GPU
 	bash scripts/env_check.sh
 
-process-data: require-scene ## Phase 1+2: video -> frames + COLMAP (ns-process-data video)
-	bash scripts/process_data.sh --scene "$(SCENE)" $(EXTRA)
-
-process-data-manual: require-scene ## Phase 1+2 with explicit focal-length seed (for videos without EXIF focal length)
+process-data: require-scene ## Phase 1+2: frames + COLMAP, focal-length-seeded (works on phone videos without EXIF)
 	bash scripts/colmap_pipeline.sh --scene "$(SCENE)" $(EXTRA)
+
+process-data-nerfstudio: require-scene ## Phase 1+2 via ns-process-data — fails silently on videos without EXIF focal length; kept for debugging
+	bash scripts/process_data.sh --scene "$(SCENE)" $(EXTRA)
 
 qc-process-data: require-scene ## Phase 1+2 exit-criteria checks (run after process-data)
 	bash scripts/qc_process_data.sh --scene "$(SCENE)"
