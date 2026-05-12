@@ -21,10 +21,14 @@ PY_VER="3.10"
 TORCH_VER="2.9.1+cu129"
 TORCHVISION_VER="0.24.1"
 TORCH_INDEX="https://download.pytorch.org/whl/cu129"
-COLMAP_SPEC="colmap=4.0.4=cuda_129*"
-# colmap 4.0.4 dynamically links libfaiss; on linux-aarch64 conda-forge does not
-# pull it transitively as of 2026-05, so we add it explicitly. Without this you
-# get: `colmap: error while loading shared libraries: libfaiss.so`
+# Pinned to colmap 3.13.0 (not 4.0.4) — nerfstudio 1.1.5's COLMAP wrapper passes
+# option names that COLMAP 4.x removed entirely (and 3.13 already renamed; the
+# nerfstudio patch in _patch_nerfstudio.sh handles that). 3.13 is the newest
+# CUDA-enabled COLMAP that nerfstudio's wrapper can drive after our patch.
+COLMAP_SPEC="colmap=3.13.0=cuda_129*"
+# COLMAP 3.13 cuda_129 dynamically links libfaiss; on linux-aarch64 conda-forge
+# does not pull it transitively as of 2026-05, so we add it explicitly.
+# Without this: `colmap: error while loading shared libraries: libfaiss.so`
 LIBFAISS_SPEC="libfaiss"
 HOST_CUDA="/usr/local/cuda-13.0"
 
@@ -97,6 +101,11 @@ log "installing nerfstudio (latest 1.1.x)"
 # which we do need. pymeshlab 2025.7+ ships an aarch64 wheel on PyPI.
 log "installing pymeshlab (undeclared transitive dep of ns-export)"
 "${PIP}" install --no-cache-dir pymeshlab
+
+# Patch nerfstudio's COLMAP wrapper to use the modern --FeatureExtraction.use_gpu
+# / --FeatureMatching.use_gpu flags. See _patch_nerfstudio.sh for context.
+log "patching nerfstudio colmap_utils.py for modern COLMAP option names"
+bash "$(dirname "$0")/_patch_nerfstudio.sh"
 
 # 7. Pre-compile gsplat's CUDA extension. This avoids a 2–5 min cold compile on
 #    the very first training step (when the user is waiting for a smoke run).

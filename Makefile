@@ -27,6 +27,12 @@ env-check: ## Phase 0 gate: prove the env works end-to-end on the GPU
 process-data: require-scene ## Phase 1+2: video -> frames + COLMAP (ns-process-data video)
 	bash scripts/process_data.sh --scene "$(SCENE)" $(EXTRA)
 
+process-data-manual: require-scene ## Phase 1+2 with explicit focal-length seed (for videos without EXIF focal length)
+	bash scripts/colmap_pipeline.sh --scene "$(SCENE)" $(EXTRA)
+
+qc-process-data: require-scene ## Phase 1+2 exit-criteria checks (run after process-data)
+	bash scripts/qc_process_data.sh --scene "$(SCENE)"
+
 train-smoke: require-scene ## Phase 4: 5k-iter smoke run, exports a .ply for viewer probe
 	bash scripts/train_splat.sh --scene "$(SCENE)" --profile smoke $(EXTRA)
 

@@ -94,7 +94,10 @@ def main() -> int:
     p.add_argument("--stage", required=True, help="phase/stage name, e.g. process_data, train_smoke")
     p.add_argument("--scene", required=True, help="scene_id")
     p.add_argument("--out", required=True, type=Path, help="path to run_meta.json")
-    p.add_argument("--arg", action="append", default=[], help="raw CLI tokens, repeated")
+    # `nargs="*"` + trailing positional consumption lets us pass any tokens — including
+    # ones that start with `--` — after a `--` sentinel. Callers pass `--arg=foo`
+    # OR everything after a literal `--`.
+    p.add_argument("--arg", action="append", default=[], help="raw CLI token; pass --arg=VAL when VAL starts with '-'")
     p.add_argument("--extra-json", default=None, help="extra fields to merge (JSON string)")
     ns = p.parse_args()
 
