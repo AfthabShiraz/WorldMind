@@ -1,0 +1,21 @@
+# Copy to configs/paths.yaml and edit. paths.yaml is gitignored so values can differ
+# per machine without touching tracked code. Scripts read this via scripts/_lib.sh.
+
+# Repo root is auto-detected from the script's own location; these are sub-paths.
+data_raw:    data/raw          # input videos: <scene_id>.mp4
+data_scenes: data/scenes       # ns-process-data --output-dir target: <scene_id>/{images,colmap,transforms.json}
+outputs:     outputs           # ns-train run dirs + exported .ply + run_meta.json
+semantics:   semantics         # Phase 8 artifacts
+
+# Conda env that hosts ns-train / colmap / ffmpeg
+conda_env_name: worldmind
+conda_prefix:   ~/miniforge3
+
+# Per-stage defaults — can be overridden by CLI flags on the wrapper scripts.
+process_data:
+  num_frames_target: 300         # plan: 150–300 for a small room
+  matching_method:   sequential  # video frames are temporally ordered
+
+train:
+  smoke_iters: 5000              # plan Phase 4: 3k–7k
+  full_iters:  30000             # splatfacto default

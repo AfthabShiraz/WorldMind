@@ -1,0 +1,38 @@
+# Heavy artifacts — see docs/IMPLEMENTATION_PLAN.md "Conventions"
+# A single scene = tens of GB; a trained 3DGS .ply is 100 MB – 1 GB+.
+# Reference artifacts by path/URL/hash in the README, do not commit.
+data/raw/*
+!data/raw/.gitkeep
+data/scenes/*
+!data/scenes/.gitkeep
+outputs/*
+!outputs/.gitkeep
+semantics/*
+!semantics/.gitkeep
+
+# Env / build
+.venv/
+.env
+*.pyc
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Local-only overrides
+configs/paths.yaml
+*.local.yaml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Misc large
+*.ply
+*.splat
+*.spz
+*.mp4
+*.mov
+*.MP4
+*.MOV
+sam_vit_*.pth
