@@ -13,7 +13,7 @@ SCENE ?=
 require-scene:
 	@test -n "$(SCENE)" || { echo "ERROR: SCENE= is required (e.g. make $(MAKECMDGOALS) SCENE=living_room)"; exit 2; }
 
-.PHONY: help install env-check run process-data process-data-manual qc-process-data train-smoke train-full export-splat lift-semantics clean-scene require-scene require-video
+.PHONY: help install env-check run process-data process-data-manual qc-process-data train-smoke train-full export-splat lift-semantics lift-semantics-v2 view-semantics clean-scene require-scene require-video
 
 help:  ## list targets
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -49,8 +49,14 @@ train-full: require-scene  ## Phase 5: full production run (~30k iters), exports
 export-splat: require-scene ## Phase 6: export latest checkpoint to outputs/<scene>/<scene>.ply
 	bash scripts/export_splat.sh --scene "$(SCENE)" $(EXTRA)
 
-lift-semantics: require-scene ## Phase 8: SAM masks + Qwen2.5-VL labels lifted to Gaussians
+lift-semantics: require-scene ## Phase 8 (v1, legacy): bakes labels into splat.ply colours
 	bash scripts/lift_semantics.sh --scene "$(SCENE)" $(EXTRA)
+
+lift-semantics-v2: require-scene ## Phase 8 (v2): depth-aware instance lifting, sidecar files, splat.ply untouched
+	bash scripts/lift_semantics_v2.sh --scene "$(SCENE)" $(EXTRA)
+
+view-semantics: require-scene ## Launch viser viewer with floating labels (needs lift-semantics-v2 outputs)
+	bash scripts/view_semantics.sh --scene "$(SCENE)" $(EXTRA)
 
 clean-scene: require-scene ## remove derived artifacts for a scene (keeps data/raw)
 	rm -rf "data/scenes/$(SCENE)" "outputs/$(SCENE)" "semantics/$(SCENE)"

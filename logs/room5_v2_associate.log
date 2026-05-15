@@ -1,0 +1,7 @@
+[23:49:10] lift-semantics-v2: scene=room5
+[23:49:10] scene=room5
+[23:49:10] [1/7 keyframes] cached: 30 keyframes
+[23:49:10] [2/7 masks] all 30 cached
+[23:49:10] [3/7 voters] cached
+[23:49:12] [4/7 associate] 653 masks -> 170 instances (1088 links above jaccard=0.2)
+[23:49:12] lift-semantics-v2: done. sidecars under semantics/room5/ (splat.ply untouched)

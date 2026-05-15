@@ -1,0 +1,12 @@
+[23:51:48] view-semantics: scene=room5
+[23:51:48] loading /home/afthabshiraz/WorldMind/outputs/room5/ply_full/splat.ply ...
+[23:51:48] loaded splat: 619,848 Gaussians, 450,523 with instance ids, 94 labelled instances
+[23:51:48] subsampled to 250,000 points for viewer
+╭─────────────── viser ───────────────╮
+│             ╷                       │
+│   HTTP      │ http://0.0.0.0:8088   │
+│   Websocket │ ws://0.0.0.0:8088     │
+│             ╵                       │
+╰─────────────────────────────────────╯
+[23:51:48] viser running at http://0.0.0.0:8088
+[23:51:48] viewer ready. Ctrl-C to quit.
