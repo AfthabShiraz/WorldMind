@@ -131,6 +131,17 @@ def main() -> int:
         out = (1.0 - tint_amount) * out + tint_amount * tint_rgb
         return np.clip(out, 0, 255).astype(np.uint8)
 
+    # --- Object anchors (optional sidecar, from place_object_labels) ------
+    anchors_path = REPO / "semantics" / args.scene / "object_anchors.json"
+    object_anchors: list[dict] = []
+    scene_diag = 1.0
+    if anchors_path.exists():
+        oa = json.loads(anchors_path.read_text())
+        object_anchors = oa.get("anchors", [])
+        scene_diag = float(oa.get("scene_diag", 1.0))
+        log(f"object anchors: {len(object_anchors)} loaded "
+            f"(scene diag {scene_diag:.2f})")
+
     # --- Scene inventory (optional sidecar) ------------------------------
     inv_path = REPO / "semantics" / args.scene / "scene_inventory.json"
     inventory_items: list[tuple[str, int]] = []
@@ -188,6 +199,13 @@ def main() -> int:
                 "`--inventory-min-frames` to see fewer-confidence items._"
             )
 
+    # Object labels (3D floating billboards above each anchor) ------------
+    if object_anchors:
+        show_obj_labels = server.gui.add_checkbox("Show object labels",
+                                                  initial_value=True)
+    else:
+        show_obj_labels = None
+
     # Point count: slider lets the user trade density vs. structure clarity
     # live, between 1% of the splat and all of it.
     slider_min = max(1000, n_total // 100)
@@ -220,9 +238,23 @@ def main() -> int:
 
     pc_holder = [_make_pc(view["xyz"], view["rgb"], args.point_size)]
 
-    # Floating per-instance 3D labels are disabled for now; the
-    # instance_anchors.json sidecar is still on disk and the inventory panel
-    # above shows the VLM's overall list. Re-enable here when needed.
+    # 3D floating labels for inventory objects, anchored just above their
+    # back-projected position. Toggle via the "Show object labels" checkbox.
+    label_handles: list = []
+    if object_anchors:
+        nudge_up = 0.04 * scene_diag   # float labels slightly above the surface
+        # Group same-label clusters so we can suffix "(2)" etc. when the room
+        # actually has multiple instances of the same object name.
+        for a in object_anchors:
+            text = a["label"]
+            if a.get("n_clusters", 1) > 1:
+                text = f"{text} ({a['cluster_idx'] + 1}/{a['n_clusters']})"
+            ax, ay, az = a["anchor"]
+            label_handles.append(server.scene.add_label(
+                name=f"/obj_labels/{a['label']}_{a.get('cluster_idx', 0)}",
+                text=text,
+                position=(ax, ay + nudge_up, az),
+            ))
 
     # --- Reactivity -------------------------------------------------------
     def remake_pc():
@@ -257,6 +289,12 @@ def main() -> int:
     @point_size.on_update
     def _(_):
         remake_pc()
+
+    if show_obj_labels is not None:
+        @show_obj_labels.on_update
+        def _(_):
+            for h in label_handles:
+                h.visible = show_obj_labels.value
 
     log("viewer ready. Ctrl-C to quit.")
     try:

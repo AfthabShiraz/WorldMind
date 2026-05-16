@@ -68,5 +68,11 @@ lift-semantics-v2: require-scene ## (Optional) depth-aware instance lifting, sid
 scene-inventory: require-scene ## (Optional) VLM-only: ask Qwen what objects are in the scene, print a list
 	bash scripts/scene_inventory.sh --scene "$(SCENE)" $(EXTRA)
 
+place-labels: require-scene ## (Optional) anchor 3D floating labels for inventory objects via Qwen grounding
+	bash scripts/place_object_labels.sh --scene "$(SCENE)" $(EXTRA)
+
+audit-bboxes: require-scene ## (Debug) overlay Qwen's bboxes on each keyframe, colour-coded by accept/reject
+	bash scripts/visualize_bboxes.sh --scene "$(SCENE)" $(EXTRA)
+
 clean-scene: require-scene ## remove derived artifacts for a scene (keeps data/raw)
 	rm -rf "data/scenes/$(SCENE)" "outputs/$(SCENE)" "semantics/$(SCENE)"
