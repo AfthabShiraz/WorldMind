@@ -49,15 +49,18 @@ def load_points_and_colors(ply_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return xyz, rgb_u8
 
 
-def subsample_points(xyz: np.ndarray, rgb: np.ndarray, inst: np.ndarray,
-                     max_pts: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = xyz.shape[0]
-    if n <= max_pts:
-        return xyz, rgb, inst
-    rng = np.random.default_rng(0)
-    sel = rng.choice(n, size=max_pts, replace=False)
+def make_permutation(n: int, seed: int = 0) -> np.ndarray:
+    """Stable random permutation; slicing perm[:k] gives a monotonic subset
+    so the slider feels like 'add more detail' instead of reshuffling."""
+    return np.random.default_rng(seed).permutation(n)
+
+
+def subset(perm: np.ndarray, k: int) -> np.ndarray:
+    """Return sorted indices for the first `k` elements of the permutation."""
+    k = max(1, min(int(k), perm.size))
+    sel = perm[:k].copy()
     sel.sort()
-    return xyz[sel], rgb[sel], inst[sel]
+    return sel
 
 
 def main() -> int:
@@ -101,8 +104,14 @@ def main() -> int:
         anchors = {}
         log(f"loaded splat: {xyz.shape[0]:,} Gaussians (no semantic sidecars)")
 
-    xyz_s, rgb_s, inst_s = subsample_points(xyz, rgb, inst_full, args.max_points)
-    log(f"subsampled to {xyz_s.shape[0]:,} points for viewer")
+    n_total = xyz.shape[0]
+    perm = make_permutation(n_total)
+    init_k = max(1, min(args.max_points, n_total))
+    sel0 = subset(perm, init_k)
+    # `view` holds the current visible subset and is mutated by the slider.
+    view = {"xyz": xyz[sel0], "rgb": rgb[sel0], "inst": inst_full[sel0]}
+    log(f"showing {view['xyz'].shape[0]:,} / {n_total:,} points "
+        f"(slider can go up to all of them)")
 
     # Instance palette as a single lookup. Empty when no semantics are loaded.
     inst_id_to_color: dict[int, tuple[int, int, int]] = {}
@@ -111,12 +120,12 @@ def main() -> int:
 
     def colors_for_mode(tint: bool, tint_amount: float) -> np.ndarray:
         if not tint or not inst_id_to_color:
-            return rgb_s
-        out = rgb_s.astype(np.float32)
+            return view["rgb"]
+        out = view["rgb"].astype(np.float32)
         # Build a per-point tint colour; -1 / unknown stays grey.
         tint_rgb = np.full_like(out, 128.0)
         for ii, col in inst_id_to_color.items():
-            sel = (inst_s == ii)
+            sel = (view["inst"] == ii)
             if sel.any():
                 tint_rgb[sel] = col
         out = (1.0 - tint_amount) * out + tint_amount * tint_rgb
@@ -166,6 +175,14 @@ def main() -> int:
                 "`--inventory-min-frames` to see fewer-confidence items._"
             )
 
+    # Point count: slider lets the user trade density vs. structure clarity
+    # live, between 1% of the splat and all of it.
+    slider_min = max(1000, n_total // 100)
+    slider_step = max(1000, (n_total - slider_min) // 200)
+    point_count = server.gui.add_slider(
+        "Points shown", min=slider_min, max=n_total,
+        step=slider_step, initial_value=init_k,
+    )
     # Tint controls only make sense when semantic sidecars are loaded.
     if has_instances:
         tint_on = server.gui.add_checkbox("Tint by instance", initial_value=False)
@@ -178,35 +195,55 @@ def main() -> int:
                                        step=0.001, initial_value=args.point_size)
 
     # --- Point cloud ------------------------------------------------------
-    pc = server.scene.add_point_cloud(
-        name="/splat",
-        points=xyz_s,
-        colors=rgb_s,
-        point_size=args.point_size,
-        point_shape="circle",
-    )
+    # viser 0.2.7's PointCloudHandle has no setters for points/colors/size,
+    # so live updates require a remove + re-add cycle. The handle is held in
+    # a one-element list so closures can mutate it.
+    def _make_pc(points, colors, size):
+        return server.scene.add_point_cloud(
+            name="/splat",
+            points=points, colors=colors,
+            point_size=size, point_shape="circle",
+        )
+
+    pc_holder = [_make_pc(view["xyz"], view["rgb"], args.point_size)]
 
     # Floating per-instance 3D labels are disabled for now; the
     # instance_anchors.json sidecar is still on disk and the inventory panel
     # above shows the VLM's overall list. Re-enable here when needed.
 
     # --- Reactivity -------------------------------------------------------
-    def refresh_colors():
-        pc.colors = colors_for_mode(tint_on.value, float(tint_amount.value))
+    def remake_pc():
+        tint_v = tint_on.value if tint_on is not None else False
+        amt = float(tint_amount.value) if tint_amount is not None else 0.0
+        colors_now = colors_for_mode(tint_v, amt)
+        with server.atomic():
+            pc_holder[0].remove()
+            pc_holder[0] = _make_pc(view["xyz"], colors_now, float(point_size.value))
+
+    def resample_to(k: int):
+        sel = subset(perm, k)
+        view["xyz"] = xyz[sel]
+        view["rgb"] = rgb[sel]
+        view["inst"] = inst_full[sel]
+        remake_pc()
+
+    @point_count.on_update
+    def _(_):
+        resample_to(int(point_count.value))
 
     if tint_on is not None:
         @tint_on.on_update
         def _(_):
-            refresh_colors()
+            remake_pc()
 
         @tint_amount.on_update
         def _(_):
             if tint_on.value:
-                refresh_colors()
+                remake_pc()
 
     @point_size.on_update
     def _(_):
-        pc.point_size = float(point_size.value)
+        remake_pc()
 
     log("viewer ready. Ctrl-C to quit.")
     try:
