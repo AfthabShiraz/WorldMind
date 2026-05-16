@@ -134,15 +134,19 @@ def main() -> int:
     # --- Scene inventory (optional sidecar) ------------------------------
     inv_path = REPO / "semantics" / args.scene / "scene_inventory.json"
     inventory_items: list[tuple[str, int]] = []
+    inventory_relations: list[dict] = []
     inv_n_keyframes = 0
     if inv_path.exists():
         inv = json.loads(inv_path.read_text())
         inv_n_keyframes = int(inv.get("n_keyframes", 0))
         threshold = (args.inventory_min_frames if args.inventory_min_frames > 0
-                     else max(2, (inv_n_keyframes + 1) // 2))
+                     else max(2, inv_n_keyframes // 3))
         inventory_items = [(name, int(c)) for name, c in inv["counts"]
                            if int(c) >= threshold]
-        log(f"scene inventory: {len(inventory_items)} items >= {threshold} frames "
+        inventory_relations = [r for r in inv.get("relations", [])
+                               if int(r["frames"]) >= threshold]
+        log(f"scene inventory: {len(inventory_items)} items + "
+            f"{len(inventory_relations)} relations >= {threshold} frames "
             f"(of {inv_n_keyframes} keyframes)")
     else:
         log(f"no scene_inventory.json at {inv_path} "
@@ -159,14 +163,23 @@ def main() -> int:
             log(f"could not get share URL ({e}); use --port + SSH tunnel instead")
 
     # --- GUI -------------------------------------------------------------
-    if inventory_items:
+    if inventory_items or inventory_relations:
         threshold = (args.inventory_min_frames if args.inventory_min_frames > 0
-                     else max(2, (inv_n_keyframes + 1) // 2))
+                     else max(2, inv_n_keyframes // 3))
         with server.gui.add_folder("Scene inventory (VLM)"):
-            md = [f"**{len(inventory_items)} items** seen in ≥ {threshold} "
-                  f"of {inv_n_keyframes} keyframes:\n"]
-            for name, c in inventory_items:
-                md.append(f"- `{c:>2}`  {name}")
+            md: list[str] = []
+            if inventory_items:
+                md.append(f"**Objects** ({len(inventory_items)}, seen in ≥ "
+                          f"{threshold} of {inv_n_keyframes} keyframes):\n")
+                for name, c in inventory_items:
+                    md.append(f"- `{c:>2}`  {name}")
+            if inventory_relations:
+                if md:
+                    md.append("")
+                md.append(f"**Spatial relations** ({len(inventory_relations)}):\n")
+                for r in inventory_relations:
+                    md.append(f"- `{r['frames']:>2}`  "
+                              f"{r['object']} *{r['relation']}* {r['anchor']}")
             server.gui.add_markdown("\n".join(md))
     elif inv_path.exists():
         with server.gui.add_folder("Scene inventory (VLM)"):
