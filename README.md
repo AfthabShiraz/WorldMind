@@ -178,19 +178,94 @@ compute capability `sm_121`, CUDA 13.0). The env is pinned for that target.
 
 ---
 
-## Optional: experimental semantics layer
+## Semantic layer
 
-There's an in-progress add-on that attaches VLM-derived object labels to
-Gaussians (SAM mask association across views + Qwen2.5-VL labelling, with
-all outputs in sidecar files so `splat.ply` is never modified). **Not part
-of the standard pipeline** and not run by `make run`.
+On top of the geometric splat, the pipeline produces a structured
+description of what the room contains. This is rendered as the
+**Scene inventory** panel in the in-browser viewer.
 
-```bash
-make scene-inventory SCENE=<name>                  # VLM-only: list significant objects
-make lift-semantics-v2 SCENE=<name>                # 3D instance lifting
-```
+### What ships today: scene-level inventory
 
-If you've run either of these, the viewer (`make view`) picks up the
-sidecars automatically and shows a "Scene inventory" GUI panel + a
-tint-by-instance toggle. With no sidecars present, the viewer just shows
-the raw splat — which is the default.
+`make scene-inventory SCENE=<name>` (also runs automatically as stage 4
+of `make run`) samples 15 keyframes from the scene and calls
+**Qwen2.5-VL-3B** three different ways:
+
+1. **Per-frame object + relation extraction.** For each keyframe Qwen
+   is asked for a list of `<object> <relation> <other_object>` phrases
+   (e.g. `book on desk`, `chair next to desk`). Output is parsed into
+   triples with a longest-match regex over the allowed relation set
+   (`on, in, under, next to, behind, above, …`).
+2. **Cross-frame aggregation.** Each object name and each
+   `(object, relation, anchor)` triple is counted by how many keyframes
+   it appears in. Items below an auto-threshold (~⅓ of keyframes) are
+   filtered out — that's the noise-rejection step. Frame-level dedup
+   inside one keyframe stops the same chair being counted twice.
+3. **Whole-room description.** A *single* multi-image Qwen call sees
+   four evenly-spaced keyframes at once and is asked for one flowing
+   paragraph: what type of room, the major furniture, and how things
+   are arranged. This is the only step that gets to see multiple views
+   simultaneously, which is why the output reads as a coherent layout
+   description rather than a list. Example output for `room5`:
+
+   > *A wooden desk sits against the wall under a window, cluttered
+   > with various items including a notebook, a lamp, and a pair of
+   > scissors. To the right of the desk is a small, open shelf filled
+   > with personal care products and a mirror reflecting part of the
+   > room. Further to the right, there is a bed with a wooden
+   > nightstand next to it, topped with a lamp and some books. The
+   > floor is covered with a striped rug…*
+
+Everything lands in `semantics/<scene>/scene_inventory.json` (counts,
+relations, per-frame triples, and the paragraph). The viewer reads
+that file and renders three sections in the GUI panel — description,
+objects, relations.
+
+This is **scene-level**, not per-Gaussian: the splat geometry is
+unchanged. The semantic layer is a sidecar file you can throw away
+and regenerate.
+
+### What we tried first and abandoned: per-Gaussian 3D labels
+
+Three earlier attempts tried to attach labels to specific points in
+the splat. All are still in the repo as opt-in experiments
+(`make lift-semantics-v2`, `make place-labels`), but none made it into
+`make run`:
+
+- **v1: bake labels into splat colours.** SAM-segment each keyframe,
+  label each mask with Qwen, project Gaussians into masks and vote.
+  Output: a new `.ply` with Gaussian colours replaced by a per-label
+  palette. This destroyed the appearance of the splat to display
+  semantics — you got one or the other, never both.
+- **v2: depth-aware instance lifting, sidecar files.** Same SAM →
+  Qwen → project-and-vote idea, but with depth filtering so Gaussians
+  behind walls didn't get votes from foreground masks, and cross-view
+  mask association so the same chair seen from 10 angles became one
+  instance instead of 10. Splat is untouched; instance IDs live in a
+  sidecar `.npy`. Better than v1 but Qwen labelled each cropped mask
+  in isolation — without scene context, a sofa cushion came back as
+  "sandwich", a radiator as "knife". Cross-view consensus helped
+  but didn't fully fix it.
+- **Option A: VLM grounding + back-projection.** Skip SAM entirely.
+  For each strongly-seen inventory object, ask Qwen for a bounding
+  box per keyframe, take the bbox centre, back-project to 3D via a
+  splat z-buffer depth proxy, cluster across views. Three safety
+  filters (local Gaussian density, scene-relative depth cap, scene
+  AABB containment) successfully prevented the worst failure mode —
+  labels flying through a window into the distance. But the bbox
+  centre often hits the wrong surface (label landing on the floor
+  beside the chair instead of the chair seat).
+- **Option A v2: ray triangulation.** Same VLM grounding, but each
+  detection becomes a 3D *ray* from the camera through the bbox
+  centre. Per object, an iteratively-reweighted least-squares solve
+  finds the 3D point where the rays converge, with Cauchy weights
+  downweighting outliers. Anchors landed accurately (residuals 1-3%
+  of scene diagonal — chair landed on chair, radiator on radiator),
+  but objects with multiple real instances (two curtains on different
+  walls) got dropped because rays couldn't converge to one point.
+
+The honest takeaway: an open-vocabulary 3B-parameter VLM does well at
+"what's in this room" but not at "where exactly is each thing in 3D",
+because grounding accuracy degrades sharply on tight crops and
+multi-instance scenes. The scene-level inventory works because the
+VLM is operating where it's strongest — full-frame description with
+multi-frame aggregation doing the noise rejection.
