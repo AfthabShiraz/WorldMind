@@ -195,6 +195,41 @@ def main() -> int:
             print(f"raw:    {raw.strip()}", file=sys.stderr)
             print(f"parsed: {triples}", file=sys.stderr)
 
+    # ---- Whole-room paragraph description ---------------------------------
+    # Show Qwen several keyframes at once and ask for a single flowing
+    # paragraph about the room's type, contents, and spatial arrangement.
+    n_desc = min(4, len(kfs))
+    desc_picks = np.linspace(0, len(kfs) - 1, n_desc, dtype=int)
+    desc_imgs = [
+        Image.open(REPO / "data" / "scenes" / args.scene / kfs[int(i)][1]).convert("RGB")
+        for i in desc_picks
+    ]
+    log(f"generating whole-room description from {len(desc_imgs)} keyframes ...")
+
+    DESC_PROMPT = (
+        "You are shown several photos taken from different angles within one "
+        "indoor room. Write ONE concise paragraph (4-6 sentences, flowing "
+        "prose, no lists, no bullet points) describing this room: what type "
+        "of room it appears to be, the major furniture and features visible, "
+        "and how things are arranged spatially relative to each other (for "
+        "example, 'a desk sits against the wall under the window'). Be "
+        "concrete and only describe what you can clearly see."
+    )
+    desc_content = [{"type": "image", "image": im} for im in desc_imgs]
+    desc_content.append({"type": "text", "text": DESC_PROMPT})
+    desc_msgs = [{"role": "user", "content": desc_content}]
+    desc_text = proc.apply_chat_template(desc_msgs, tokenize=False, add_generation_prompt=True)
+    desc_inputs = proc(text=[desc_text], images=desc_imgs, padding=True,
+                       return_tensors="pt").to("cuda")
+    with torch.inference_mode():
+        desc_gen = model.generate(**desc_inputs, max_new_tokens=400, do_sample=False)
+    desc_out_ids = desc_gen[:, desc_inputs.input_ids.shape[1]:]
+    description = proc.batch_decode(desc_out_ids, skip_special_tokens=True)[0].strip()
+    # Strip any leading "Here is/This room/..." overhead if Qwen ignores the "no preamble" instruction.
+    description = re.sub(r"^(here is|here's|this is|the room|in this room)\b[^.]*\.\s*",
+                         "", description, flags=re.IGNORECASE).strip()
+    log(f"description ({len(description)} chars): {description[:160]}...")
+
     # Save
     out_dir = REPO / "semantics" / args.scene
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -203,6 +238,9 @@ def main() -> int:
         "scene": args.scene,
         "n_keyframes": len(kfs),
         "prompt": PROMPT,
+        "description": description,
+        "description_prompt": DESC_PROMPT,
+        "description_keyframes": [int(kfs[int(i)][0]) for i in desc_picks],
         "counts": object_counts.most_common(),
         "relations": [
             {"object": o, "relation": r, "anchor": a, "frames": int(c)}
@@ -214,6 +252,12 @@ def main() -> int:
     # ---- Print summary -----------------------------------------------------
     print()
     print(f"=== Scene inventory: {args.scene}  ({len(kfs)} keyframes) ===")
+    print()
+    print("ROOM DESCRIPTION")
+    print(f"{'-'*70}")
+    # Hard-wrap so the console output stays readable.
+    import textwrap
+    print(textwrap.fill(description, width=70))
     print()
     print("OBJECTS  (n frames mentioning each)")
     print(f"{'-'*6}  {'-'*30}")

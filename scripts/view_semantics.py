@@ -146,6 +146,7 @@ def main() -> int:
     inv_path = REPO / "semantics" / args.scene / "scene_inventory.json"
     inventory_items: list[tuple[str, int]] = []
     inventory_relations: list[dict] = []
+    inventory_description: str = ""
     inv_n_keyframes = 0
     if inv_path.exists():
         inv = json.loads(inv_path.read_text())
@@ -156,9 +157,12 @@ def main() -> int:
                            if int(c) >= threshold]
         inventory_relations = [r for r in inv.get("relations", [])
                                if int(r["frames"]) >= threshold]
+        inventory_description = inv.get("description", "").strip()
         log(f"scene inventory: {len(inventory_items)} items + "
             f"{len(inventory_relations)} relations >= {threshold} frames "
-            f"(of {inv_n_keyframes} keyframes)")
+            f"(of {inv_n_keyframes} keyframes)"
+            + (f"; description loaded ({len(inventory_description)} chars)"
+               if inventory_description else ""))
     else:
         log(f"no scene_inventory.json at {inv_path} "
             f"(run `make scene-inventory SCENE={args.scene}` to enable the panel)")
@@ -174,12 +178,17 @@ def main() -> int:
             log(f"could not get share URL ({e}); use --port + SSH tunnel instead")
 
     # --- GUI -------------------------------------------------------------
-    if inventory_items or inventory_relations:
+    if inventory_items or inventory_relations or inventory_description:
         threshold = (args.inventory_min_frames if args.inventory_min_frames > 0
                      else max(2, inv_n_keyframes // 3))
         with server.gui.add_folder("Scene inventory (VLM)"):
             md: list[str] = []
+            if inventory_description:
+                md.append("**Room description**\n")
+                md.append(f"_{inventory_description}_")
             if inventory_items:
+                if md:
+                    md.append("")
                 md.append(f"**Objects** ({len(inventory_items)}, seen in ≥ "
                           f"{threshold} of {inv_n_keyframes} keyframes):\n")
                 for name, c in inventory_items:
