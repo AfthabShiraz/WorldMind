@@ -9,6 +9,10 @@ frame extraction, no COLMAP wrestling, no Nerfstudio CLI to learn.
 |---|---|
 | ![Example scene rendered from the trained splat — bedroom-with-workspace `room5`](splatscreenshot.png) | ![The bundled viser viewer running locally, with Points-shown and Point-size sliders](localviewer.png) |
 
+The phone capture that fed both — [`room5.mp4`](https://github.com/AfthabShiraz/WorldMind/releases/download/v0.1-room5/room5.mp4) (~45 s, 297 MB):
+
+<video src="https://github.com/AfthabShiraz/WorldMind/releases/download/v0.1-room5/room5.mp4" controls></video>
+
 ```
 video.mp4
    ↓  make run VIDEO=video.mp4
