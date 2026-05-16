@@ -13,7 +13,7 @@ SCENE ?=
 require-scene:
 	@test -n "$(SCENE)" || { echo "ERROR: SCENE= is required (e.g. make $(MAKECMDGOALS) SCENE=living_room)"; exit 2; }
 
-.PHONY: help install env-check run process-data process-data-manual qc-process-data train-smoke train-full export-splat lift-semantics lift-semantics-v2 view-semantics clean-scene require-scene require-video
+.PHONY: help install install-viewer env-check run view view-example fetch-example process-data process-data-manual qc-process-data train-smoke train-full export-splat lift-semantics-v2 view-semantics scene-inventory clean-scene require-scene require-video
 
 help:  ## list targets
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -25,8 +25,11 @@ require-video:
 run: require-video ## ONE-SHOT: video -> .ply. Usage: make run VIDEO=/path/to/clip.mp4 [SCENE=name] [PROFILE=full|smoke]
 	bash scripts/run.sh --video "$(VIDEO)" $(if $(SCENE),--scene "$(SCENE)") $(if $(PROFILE),--profile "$(PROFILE)") $(EXTRA)
 
-install: ## Phase 0: install miniforge + conda env + torch + nerfstudio (idempotent)
+install: ## Full install: miniforge + conda env + torch + nerfstudio. Needed to TRAIN scenes.
 	bash scripts/install_env.sh
+
+install-viewer: ## Lightweight install: just viser+plyfile+numpy via pip. Enough to VIEW .ply files.
+	@python3 -m pip install -r requirements-viewer.txt
 
 env-check: ## Phase 0 gate: prove the env works end-to-end on the GPU
 	bash scripts/env_check.sh
@@ -49,14 +52,21 @@ train-full: require-scene  ## Phase 5: full production run (~30k iters), exports
 export-splat: require-scene ## Phase 6: export latest checkpoint to outputs/<scene>/<scene>.ply
 	bash scripts/export_splat.sh --scene "$(SCENE)" $(EXTRA)
 
-lift-semantics: require-scene ## Phase 8 (v1, legacy): bakes labels into splat.ply colours
-	bash scripts/lift_semantics.sh --scene "$(SCENE)" $(EXTRA)
+view: require-scene ## Launch in-browser viewer for a scene (localhost:8080). Add EXTRA=--share for public URL.
+	bash scripts/view_semantics.sh --scene "$(SCENE)" $(EXTRA)
 
-lift-semantics-v2: require-scene ## Phase 8 (v2): depth-aware instance lifting, sidecar files, splat.ply untouched
+fetch-example: ## Download the room5 example .ply (~150 MB) from the GitHub release if not already present
+	bash scripts/fetch_example.sh
+
+view-example: fetch-example ## Auto-download + view the bundled room5 example scene on localhost:8080
+	bash scripts/view_semantics.sh --scene room5 $(EXTRA)
+
+# --- Optional: experimental semantics layer (not part of the standard pipeline)
+lift-semantics-v2: require-scene ## (Optional) depth-aware instance lifting, sidecar files. splat.ply untouched.
 	bash scripts/lift_semantics_v2.sh --scene "$(SCENE)" $(EXTRA)
 
-view-semantics: require-scene ## Launch viser viewer with floating labels (needs lift-semantics-v2 outputs)
-	bash scripts/view_semantics.sh --scene "$(SCENE)" $(EXTRA)
+scene-inventory: require-scene ## (Optional) VLM-only: ask Qwen what objects are in the scene, print a list
+	bash scripts/scene_inventory.sh --scene "$(SCENE)" $(EXTRA)
 
 clean-scene: require-scene ## remove derived artifacts for a scene (keeps data/raw)
 	rm -rf "data/scenes/$(SCENE)" "outputs/$(SCENE)" "semantics/$(SCENE)"

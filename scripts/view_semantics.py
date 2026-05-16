@@ -67,36 +67,50 @@ def main() -> int:
     ap.add_argument("--max-points", type=int, default=250_000,
                     help="Subsample Gaussian centres to at most N points for the viewer.")
     ap.add_argument("--point-size", type=float, default=0.005)
+    ap.add_argument("--inventory-min-frames", type=int, default=0,
+                    help="Items needing this many keyframe sightings to show "
+                         "in the scene-inventory panel. 0 = auto (>=50%% of keyframes).")
+    ap.add_argument("--share", action="store_true",
+                    help="Request a public viser share URL so the viewer can be "
+                         "opened from outside this machine (no SSH needed).")
     args = ap.parse_args()
 
     import viser
 
     ply_path = REPO / "outputs" / args.scene / "ply_full" / "splat.ply"
+    if not ply_path.exists():
+        log(f"ERROR: missing {ply_path} — run `make run VIDEO=...` first")
+        return 2
+
+    # Semantic sidecars are OPTIONAL. Without them the viewer just shows the
+    # raw splat (no tinting, no inventory panel) — this is the default path
+    # because the semantics pipeline is not part of the standard flow.
     inst_path = REPO / "semantics" / args.scene / "gaussian_instances.npy"
     anch_path = REPO / "semantics" / args.scene / "instance_anchors.json"
-    for p in (ply_path, inst_path, anch_path):
-        if not p.exists():
-            log(f"ERROR: missing {p}")
-            return 2
+    has_instances = inst_path.exists() and anch_path.exists()
 
     xyz, rgb = load_points_and_colors(ply_path)
-    inst_full = np.load(inst_path).astype(np.int32)
-    anchors: dict[str, dict] = json.loads(anch_path.read_text())
-    log(f"loaded splat: {xyz.shape[0]:,} Gaussians, "
-        f"{(inst_full >= 0).sum():,} with instance ids, "
-        f"{len(anchors)} labelled instances")
+    if has_instances:
+        inst_full = np.load(inst_path).astype(np.int32)
+        anchors: dict[str, dict] = json.loads(anch_path.read_text())
+        log(f"loaded splat: {xyz.shape[0]:,} Gaussians, "
+            f"{(inst_full >= 0).sum():,} with instance ids, "
+            f"{len(anchors)} labelled instances")
+    else:
+        inst_full = np.full(xyz.shape[0], -1, dtype=np.int32)
+        anchors = {}
+        log(f"loaded splat: {xyz.shape[0]:,} Gaussians (no semantic sidecars)")
 
     xyz_s, rgb_s, inst_s = subsample_points(xyz, rgb, inst_full, args.max_points)
     log(f"subsampled to {xyz_s.shape[0]:,} points for viewer")
 
-    # Instance palette as a single (N_inst, 3) lookup.
-    inst_ids_sorted = sorted(int(k) for k in anchors.keys())
+    # Instance palette as a single lookup. Empty when no semantics are loaded.
     inst_id_to_color: dict[int, tuple[int, int, int]] = {}
     for ii_str, a in anchors.items():
         inst_id_to_color[int(ii_str)] = tuple(a["palette_rgb"])
 
     def colors_for_mode(tint: bool, tint_amount: float) -> np.ndarray:
-        if not tint:
+        if not tint or not inst_id_to_color:
             return rgb_s
         out = rgb_s.astype(np.float32)
         # Build a per-point tint colour; -1 / unknown stays grey.
@@ -108,16 +122,58 @@ def main() -> int:
         out = (1.0 - tint_amount) * out + tint_amount * tint_rgb
         return np.clip(out, 0, 255).astype(np.uint8)
 
+    # --- Scene inventory (optional sidecar) ------------------------------
+    inv_path = REPO / "semantics" / args.scene / "scene_inventory.json"
+    inventory_items: list[tuple[str, int]] = []
+    inv_n_keyframes = 0
+    if inv_path.exists():
+        inv = json.loads(inv_path.read_text())
+        inv_n_keyframes = int(inv.get("n_keyframes", 0))
+        threshold = (args.inventory_min_frames if args.inventory_min_frames > 0
+                     else max(2, (inv_n_keyframes + 1) // 2))
+        inventory_items = [(name, int(c)) for name, c in inv["counts"]
+                           if int(c) >= threshold]
+        log(f"scene inventory: {len(inventory_items)} items >= {threshold} frames "
+            f"(of {inv_n_keyframes} keyframes)")
+    else:
+        log(f"no scene_inventory.json at {inv_path} "
+            f"(run `make scene-inventory SCENE={args.scene}` to enable the panel)")
+
     server = viser.ViserServer(host="0.0.0.0", port=args.port)
     log(f"viser running at http://0.0.0.0:{args.port}")
+    if args.share:
+        try:
+            url = server.request_share_url()
+            log(f"PUBLIC SHARE URL: {url}")
+            log("anyone with that link can view the scene from outside this machine")
+        except Exception as e:
+            log(f"could not get share URL ({e}); use --port + SSH tunnel instead")
 
     # --- GUI -------------------------------------------------------------
-    show_labels = server.gui.add_checkbox("Show labels", initial_value=True)
-    tint_on = server.gui.add_checkbox("Tint by instance", initial_value=False)
-    tint_amount = server.gui.add_slider("Tint amount", min=0.0, max=1.0,
-                                        step=0.05, initial_value=0.5)
-    top_n = server.gui.add_slider("Max labels visible", min=1, max=200,
-                                  step=1, initial_value=min(40, len(anchors)))
+    if inventory_items:
+        threshold = (args.inventory_min_frames if args.inventory_min_frames > 0
+                     else max(2, (inv_n_keyframes + 1) // 2))
+        with server.gui.add_folder("Scene inventory (VLM)"):
+            md = [f"**{len(inventory_items)} items** seen in ≥ {threshold} "
+                  f"of {inv_n_keyframes} keyframes:\n"]
+            for name, c in inventory_items:
+                md.append(f"- `{c:>2}`  {name}")
+            server.gui.add_markdown("\n".join(md))
+    elif inv_path.exists():
+        with server.gui.add_folder("Scene inventory (VLM)"):
+            server.gui.add_markdown(
+                "_No items pass the frame threshold. Lower "
+                "`--inventory-min-frames` to see fewer-confidence items._"
+            )
+
+    # Tint controls only make sense when semantic sidecars are loaded.
+    if has_instances:
+        tint_on = server.gui.add_checkbox("Tint by instance", initial_value=False)
+        tint_amount = server.gui.add_slider("Tint amount", min=0.0, max=1.0,
+                                            step=0.05, initial_value=0.5)
+    else:
+        tint_on = None
+        tint_amount = None
     point_size = server.gui.add_slider("Point size", min=0.001, max=0.05,
                                        step=0.001, initial_value=args.point_size)
 
@@ -130,58 +186,28 @@ def main() -> int:
         point_shape="circle",
     )
 
-    # --- Labels (one viser label per instance, anchored at top point) -----
-    label_handles: dict[int, "viser.LabelHandle"] = {}
-    for ii_str, a in anchors.items():
-        ii = int(ii_str)
-        h = server.scene.add_label(
-            name=f"/labels/{ii:04d}",
-            text=f"{a['label']} ({a['n_gaussians']})",
-            position=tuple(a["top"]),
-        )
-        label_handles[ii] = h
+    # Floating per-instance 3D labels are disabled for now; the
+    # instance_anchors.json sidecar is still on disk and the inventory panel
+    # above shows the VLM's overall list. Re-enable here when needed.
 
     # --- Reactivity -------------------------------------------------------
     def refresh_colors():
         pc.colors = colors_for_mode(tint_on.value, float(tint_amount.value))
 
-    @tint_on.on_update
-    def _(_):
-        refresh_colors()
-
-    @tint_amount.on_update
-    def _(_):
-        if tint_on.value:
+    if tint_on is not None:
+        @tint_on.on_update
+        def _(_):
             refresh_colors()
+
+        @tint_amount.on_update
+        def _(_):
+            if tint_on.value:
+                refresh_colors()
 
     @point_size.on_update
     def _(_):
         pc.point_size = float(point_size.value)
 
-    def update_label_visibility():
-        if not show_labels.value:
-            for h in label_handles.values():
-                h.visible = False
-            return
-        # Show only the N instances with the most Gaussians (a stable proxy
-        # for "the biggest/most-important objects nearby"). For a true
-        # camera-distance fade you would project the camera each frame; this
-        # keeps it simple and predictable.
-        scored = sorted(
-            ((ii, anchors[str(ii)]["n_gaussians"]) for ii in label_handles),
-            key=lambda kv: -kv[1],
-        )
-        keep = {ii for ii, _ in scored[: int(top_n.value)]}
-        for ii, h in label_handles.items():
-            h.visible = (ii in keep)
-
-    @show_labels.on_update
-    def _(_): update_label_visibility()
-
-    @top_n.on_update
-    def _(_): update_label_visibility()
-
-    update_label_visibility()
     log("viewer ready. Ctrl-C to quit.")
     try:
         while True:

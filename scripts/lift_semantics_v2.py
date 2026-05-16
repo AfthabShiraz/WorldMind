@@ -382,11 +382,46 @@ def _clean_label(raw: str) -> str:
     return label.split()[0] if label else "unknown"
 
 
+def _qwen_label_crop(model, proc, pil: "Image.Image", prompt: str) -> str:
+    import torch
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": pil},
+        {"type": "text", "text": prompt},
+    ]}]
+    text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = proc(text=[text], images=[pil], padding=True, return_tensors="pt").to("cuda")
+    with torch.inference_mode():
+        gen_ids = model.generate(**inputs, max_new_tokens=8, do_sample=False)
+    out_ids = gen_ids[:, inputs.input_ids.shape[1]:]
+    return proc.batch_decode(out_ids, skip_special_tokens=True)[0]
+
+
+def _build_label_crop(scene: str, kf: dict, seg: np.ndarray, bbox: np.ndarray,
+                      pad_frac: float = 0.15, dim_factor: float = 0.5) -> "Image.Image":
+    """Bigger context crop + softer dim so the VLM sees the object in situ."""
+    img = np.array(Image.open(REPO / "data" / "scenes" / scene / kf["file_path"]).convert("RGB"))
+    H, W = img.shape[:2]
+    x, y, bw, bh = bbox
+    pad = max(16, int(pad_frac * max(bw, bh)))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(W, x + bw + pad), min(H, y + bh + pad)
+    crop = img[y0:y1, x0:x1].copy()
+    seg_c = seg[y0:y1, x0:x1]
+    crop[~seg_c] = (crop[~seg_c] * dim_factor).astype(np.uint8)
+    return Image.fromarray(crop)
+
+
 def stage_label(scene: str, kfs: list[dict], voter_data: dict, assoc: dict,
-                min_voters_per_instance: int, force: bool) -> dict:
+                inst_arr: np.ndarray, min_gaussians: int, label_views: int,
+                force: bool) -> dict:
+    """For each instance with enough lifted Gaussians, run Qwen on the top-K
+    voter-count views and keep the majority label. Instances without a
+    majority get label="unknown" and are filtered out by stage_export. Each
+    labelled crop is dumped to semantics/<scene>/audit/ for spot-checks."""
     out_path = REPO / "semantics" / scene / "instance_labels.json"
+    audit_dir = ensure_dir(REPO / "semantics" / scene / "audit")
     if out_path.exists() and not force:
-        log(f"[5/7 label] cached")
+        log(f"[6/7 label] cached")
         return json.loads(out_path.read_text())
 
     keys = voter_data["keys"]
@@ -396,27 +431,32 @@ def stage_label(scene: str, kfs: list[dict], voter_data: dict, assoc: dict,
         int(k): v for k, v in assoc["inst_to_masks"].items()
     }
 
-    # Decide which instances are worth labelling.
+    # Pre-compute Gaussian count per instance from the lifted array.
+    unique, counts = np.unique(inst_arr[inst_arr >= 0], return_counts=True)
+    n_gauss_by_inst = dict(zip(unique.tolist(), counts.tolist()))
+
     keep: dict[int, dict] = {}
+    skipped_small = 0
     for ii, mlist in inst_to_masks.items():
-        # union of voter sets
+        n_g = int(n_gauss_by_inst.get(ii, 0))
+        if n_g < min_gaussians:
+            skipped_small += 1
+            continue
         union = set()
         for mi in mlist:
             union.update(voters[mi].tolist())
-        if len(union) < min_voters_per_instance:
-            continue
-        # pick the view with the most voters as the "best view"
-        best_mi = max(mlist, key=lambda mi: sizes[mi])
+        top_k = sorted(mlist, key=lambda mi: -sizes[mi])[:label_views]
         keep[ii] = {
-            "best_mi": int(best_mi),
+            "top_k_mi": [int(mi) for mi in top_k],
             "n_views": len(mlist),
             "n_voters": len(union),
+            "n_gaussians": n_g,
         }
 
-    log(f"[5/7 label] {len(keep)} instances pass min-voters={min_voters_per_instance} "
-        f"(dropped {len(inst_to_masks) - len(keep)} small/noisy)")
+    log(f"[6/7 label] {len(keep)} instances pass min-gaussians={min_gaussians} "
+        f"(skipped {skipped_small} below threshold); K={label_views} views per instance")
 
-    log(f"[5/7 label] loading Qwen2.5-VL-3B ...")
+    log(f"[6/7 label] loading Qwen2.5-VL-3B ...")
     import torch
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -425,76 +465,104 @@ def stage_label(scene: str, kfs: list[dict], voter_data: dict, assoc: dict,
         QWEN_ID, torch_dtype=torch.bfloat16, device_map="cuda"
     ).eval()
 
-    prompt = ("What single object is shown in this image? "
-              "Reply with ONE noun, lowercase, no article, no description.")
+    prompt = (
+        "This is a crop of an indoor scene with one object highlighted "
+        "(surroundings darkened). What is the highlighted object? Reply with "
+        "ONE common English noun in lowercase (e.g. chair, table, lamp). "
+        "If you are unsure, reply exactly: unknown"
+    )
 
     kfs_by_idx = {k["idx_in_transforms"]: k for k in kfs}
     masks_dir = REPO / "semantics" / scene / "masks"
 
+    n_majority = 0
+    n_unknown = 0
     for ii, info in tqdm(list(keep.items()), desc="Qwen", file=sys.stderr):
-        kf_idx, mask_idx = keys[info["best_mi"]]
-        kf_idx = int(kf_idx); mask_idx = int(mask_idx)
-        k = kfs_by_idx[kf_idx]
-        img = np.array(Image.open(REPO / "data" / "scenes" / scene / k["file_path"]).convert("RGB"))
-        H, W = img.shape[:2]
-        d = np.load(masks_dir / f"kf{kf_idx:04d}.npz")
-        seg = d["segs"][mask_idx]
-        x, y, bw, bh = d["bboxes"][mask_idx]
-        pad = max(8, int(0.05 * max(bw, bh)))
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(W, x + bw + pad), min(H, y + bh + pad)
-        crop = img[y0:y1, x0:x1].copy()
-        seg_c = seg[y0:y1, x0:x1]
-        crop[~seg_c] = (crop[~seg_c] * 0.25).astype(np.uint8)
-        pil = Image.fromarray(crop)
+        votes: Counter = Counter()
+        per_view: list[dict] = []
+        best_voters = -1
+        best_kf = best_mask = None
+        for mi in info["top_k_mi"]:
+            kf_idx, mask_idx = keys[mi]
+            kf_idx = int(kf_idx); mask_idx = int(mask_idx)
+            k = kfs_by_idx[kf_idx]
+            d = np.load(masks_dir / f"kf{kf_idx:04d}.npz")
+            seg = d["segs"][mask_idx]
+            bbox = d["bboxes"][mask_idx]
+            pil = _build_label_crop(scene, k, seg, bbox)
+            raw = _qwen_label_crop(model, proc, pil, prompt)
+            lab = _clean_label(raw)
+            votes[lab] += 1
+            per_view.append({"kf": kf_idx, "mask": mask_idx, "label": lab, "raw": raw.strip()})
+            n_vot = int(sizes[mi])
+            if n_vot > best_voters:
+                best_voters, best_kf, best_mask = n_vot, kf_idx, mask_idx
+                # Save the best-view crop for audit (one image per instance).
+                pil.save(audit_dir / f"{ii:04d}_pending.jpg", quality=85)
 
-        messages = [{"role": "user", "content": [
-            {"type": "image", "image": pil},
-            {"type": "text", "text": prompt},
-        ]}]
-        text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = proc(text=[text], images=[pil], padding=True, return_tensors="pt").to("cuda")
-        with torch.inference_mode():
-            gen_ids = model.generate(**inputs, max_new_tokens=8, do_sample=False)
-        out_ids = gen_ids[:, inputs.input_ids.shape[1]:]
-        raw = proc.batch_decode(out_ids, skip_special_tokens=True)[0]
-        info["label"] = _clean_label(raw)
-        info["best_kf"] = kf_idx
-        info["best_mask"] = mask_idx
+        # Mode + majority test: require strictly more than half the views,
+        # excluding "unknown" from the running.
+        non_unk = Counter({k: v for k, v in votes.items() if k != "unknown"})
+        if non_unk:
+            top_label, top_count = non_unk.most_common(1)[0]
+            majority = top_count > len(info["top_k_mi"]) / 2
+        else:
+            top_label, top_count, majority = "unknown", votes.get("unknown", 0), False
+
+        info["label"] = top_label if majority else "unknown"
+        info["confidence"] = top_count / max(1, len(info["top_k_mi"]))
+        info["votes"] = dict(votes)
+        info["per_view"] = per_view
+        info["best_kf"] = best_kf
+        info["best_mask"] = best_mask
+
+        # Rename audit crop to include final label.
+        pending = audit_dir / f"{ii:04d}_pending.jpg"
+        if pending.exists():
+            safe = re.sub(r"[^a-zA-Z0-9_-]", "_", info["label"])[:24]
+            pending.rename(audit_dir / f"{ii:04d}_{safe}_c{info['confidence']:.2f}.jpg")
+        if majority: n_majority += 1
+        else:        n_unknown  += 1
+
+    log(f"[6/7 label] majority: {n_majority}, unknown: {n_unknown}")
+    summary = Counter(v["label"] for v in keep.values() if v["label"] != "unknown")
+    log(f"[6/7 label] top labels: {summary.most_common(10)}")
+    log(f"[6/7 label] audit crops -> {audit_dir}")
 
     out_path.write_text(json.dumps({str(k): v for k, v in keep.items()}, indent=2))
-    summary = Counter(v["label"] for v in keep.values())
-    log(f"[5/7 label] top labels: {summary.most_common(10)}")
     del model, proc
     torch.cuda.empty_cache()
     return {str(k): v for k, v in keep.items()}
 
 
 # ---------------------------------------------------------------------------
-# Stage 6 — lift instance IDs to Gaussians (majority vote weighted by mask size)
+# Stage 5 — lift instance IDs to Gaussians.
+#
+# Each (mask, gaussian) pair contributes one vote to that mask's instance.
+# This lets an instance that's seen in many keyframes outvote a single huge
+# wall/floor mask, which was the failure mode of mask-area weighting (chairs
+# kept losing their Gaussians to background masks).
 # ---------------------------------------------------------------------------
 
-def stage_lift(scene: str, voter_data: dict, assoc: dict, labels: dict) -> np.ndarray:
-    keys = voter_data["keys"]
+def stage_lift(scene: str, voter_data: dict, assoc: dict) -> np.ndarray:
+    cache_path = REPO / "semantics" / scene / "gaussian_instances_pre.npy"
+    if cache_path.exists():
+        log(f"[5/7 lift] cached")
+        return np.load(cache_path)
+
     voters = voter_data["voters"]
-    mask_areas = voter_data["mask_areas"]
     inst_of_mask: list[int] = assoc["inst_of_mask"]
-    keep_ids = {int(k) for k in labels.keys()}
 
     xyz = load_splat_xyz(scene)
     n_gauss = xyz.shape[0]
-    log(f"[6/7 lift] voting over {n_gauss:,} Gaussians ...")
+    log(f"[5/7 lift] voting over {n_gauss:,} Gaussians (vote-count weighting) ...")
 
-    # gaussian_idx -> {instance_id: accumulated weight}
+    # gaussian_idx -> {instance_id: vote count across all masks of that instance}
     votes: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
     for mi, vs in enumerate(voters):
         inst = inst_of_mask[mi]
-        if inst not in keep_ids:
-            continue
-        # weight by mask area so big, well-supported masks dominate
-        w = float(mask_areas[mi])
         for g in vs.tolist():
-            votes[g][inst] += w
+            votes[g][inst] += 1.0
 
     inst_arr = np.full(n_gauss, -1, dtype=np.int32)
     for gi, inst_w in votes.items():
@@ -502,8 +570,9 @@ def stage_lift(scene: str, voter_data: dict, assoc: dict, labels: dict) -> np.nd
         inst_arr[gi] = best_inst
 
     n_assigned = int((inst_arr >= 0).sum())
-    log(f"[6/7 lift] {n_assigned:,} / {n_gauss:,} Gaussians assigned "
+    log(f"[5/7 lift] {n_assigned:,} / {n_gauss:,} Gaussians assigned "
         f"({100*n_assigned/n_gauss:.1f}%)")
+    np.save(cache_path, inst_arr)
     return inst_arr
 
 
@@ -518,37 +587,124 @@ def palette_for(label: str, inst_id: int) -> tuple[int, int, int]:
     return (int(h[0]), int(h[1]), int(h[2]))
 
 
-def stage_export(scene: str, inst_arr: np.ndarray, labels: dict) -> None:
+def stage_export(scene: str, inst_arr: np.ndarray, labels: dict,
+                 scatter_ratio: float, max_size_frac: float,
+                 dedup_factor: float, up_axis: str) -> None:
     out_dir = ensure_dir(REPO / "semantics" / scene)
     xyz = load_splat_xyz(scene)
 
     np.save(out_dir / "gaussian_instances.npy", inst_arr)
     log(f"[7/7 export] wrote gaussian_instances.npy ({inst_arr.size} ints)")
 
-    anchors: dict[str, dict] = {}
+    # Scene-relative size cap: drop instances whose inlier diag exceeds a
+    # fraction of the scene's own diagonal. Catches floater clusters that span
+    # the whole scene.
+    scene_lo = np.percentile(xyz, 1, axis=0)
+    scene_hi = np.percentile(xyz, 99, axis=0)
+    scene_diag = float(np.linalg.norm(scene_hi - scene_lo))
+    max_diag = max_size_frac * scene_diag
+    log(f"[7/7 export] scene diag={scene_diag:.2f}, max instance diag={max_diag:.2f}")
+
+    # Up-axis vector in splat coordinates. For nerfstudio splatfacto with
+    # orientation_method=up the world gravity is aligned so +y is up; allow
+    # an override flag for scenes oriented differently.
+    up_vec = {"+y": np.array([0, 1, 0]), "-y": np.array([0, -1, 0]),
+              "+z": np.array([0, 0, 1]), "-z": np.array([0, 0, -1])}[up_axis]
+    up_idx = int(np.argmax(np.abs(up_vec)))
+    up_sign = float(np.sign(up_vec[up_idx]))
+
+    dropped_scatter = dropped_unknown = dropped_huge = 0
+    raw_anchors: list[dict] = []
     for ii_str, info in labels.items():
         ii = int(ii_str)
         sel = (inst_arr == ii)
-        if not sel.any():
+        n = int(sel.sum())
+        if info.get("label", "unknown") in ("", "unknown"):
+            dropped_unknown += 1
+            continue
+        if n == 0:
             continue
         pts = xyz[sel]
-        anchor = pts.mean(axis=0)
-        top = pts.max(axis=0)
-        # Lift the label slightly above the object's top so it floats.
-        size = (top - pts.min(axis=0))
-        anchor_y_top = float(top[1] + 0.05 * float(np.linalg.norm(size)))
-        anchors[ii_str] = {
+        # Robust centroid + spread; reject if very scattered (= merged with
+        # background / split across the scene).
+        centroid = np.median(pts, axis=0)
+        d2c = np.linalg.norm(pts - centroid, axis=1)
+        med = float(np.median(d2c)) + 1e-6
+        p95 = float(np.percentile(d2c, 95))
+        if p95 > scatter_ratio * med:
+            dropped_scatter += 1
+            continue
+        # Diagonal of the inlier (5–95 pct) AABB — robust to a few outlier
+        # Gaussians that snuck in.
+        lo = np.percentile(pts, 5, axis=0)
+        hi = np.percentile(pts, 95, axis=0)
+        diag = float(np.linalg.norm(hi - lo))
+        if diag > max_diag:
+            dropped_huge += 1
+            continue
+        # Pick the "top" of the object along the up-axis (95th percentile if
+        # up_sign>0, else 5th) and float the label just above it.
+        if up_sign > 0:
+            top_u = float(np.percentile(pts[:, up_idx], 95))
+        else:
+            top_u = float(np.percentile(pts[:, up_idx], 5))
+        top_pos = centroid.copy()
+        top_pos[up_idx] = top_u + up_sign * 0.10 * diag
+
+        raw_anchors.append({
+            "id": ii,
             "label": info["label"],
-            "n_gaussians": int(sel.sum()),
+            "confidence": float(info.get("confidence", 1.0)),
+            "n_gaussians": n,
             "n_views": int(info["n_views"]),
             "n_voters": int(info["n_voters"]),
-            "anchor": [float(anchor[0]), float(anchor[1]), float(anchor[2])],
-            "top": [float(top[0]), anchor_y_top, float(top[2])],
+            "anchor": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+            "top": [float(top_pos[0]), float(top_pos[1]), float(top_pos[2])],
+            "diag": diag,
             "palette_rgb": list(palette_for(info["label"], ii)),
-        }
+        })
 
-    (out_dir / "instance_anchors.json").write_text(json.dumps(anchors, indent=2))
-    log(f"[7/7 export] wrote instance_anchors.json ({len(anchors)} instances)")
+    log(f"[7/7 export] after filters: {len(raw_anchors)} instances "
+        f"(dropped: unknown={dropped_unknown}, scattered={dropped_scatter}, "
+        f"oversized={dropped_huge})")
+
+    # De-dup: merge same-label instances whose anchors are close compared to
+    # their own diagonals. Keep the entry with the most Gaussians per group.
+    raw_anchors.sort(key=lambda a: -a["n_gaussians"])
+    kept: list[dict] = []
+    merged_into: dict[int, int] = {}
+    for a in raw_anchors:
+        absorbed = False
+        for k in kept:
+            if k["label"] != a["label"]:
+                continue
+            dist = float(np.linalg.norm(np.array(a["anchor"]) - np.array(k["anchor"])))
+            # Use max(diag) so a big real instance absorbs nearby tiny splits.
+            threshold = dedup_factor * max(a["diag"], k["diag"])
+            if dist < threshold:
+                merged_into[a["id"]] = k["id"]
+                k["n_gaussians"] += a["n_gaussians"]
+                absorbed = True
+                break
+        if not absorbed:
+            kept.append(a)
+
+    log(f"[7/7 export] after dedup: {len(kept)} instances "
+        f"(merged {len(merged_into)} duplicates)")
+
+    # Apply the merges to the per-Gaussian instance array so the viewer's
+    # "tint by instance" is consistent with the kept anchors.
+    if merged_into:
+        for old, new in merged_into.items():
+            inst_arr[inst_arr == old] = new
+        np.save(out_dir / "gaussian_instances.npy", inst_arr)
+
+    anchors_out: dict[str, dict] = {str(a["id"]): a for a in kept}
+    (out_dir / "instance_anchors.json").write_text(json.dumps(anchors_out, indent=2))
+    log(f"[7/7 export] wrote instance_anchors.json ({len(anchors_out)} instances)")
+
+    summary = Counter(a["label"] for a in kept)
+    log(f"[7/7 export] final labels: {summary.most_common(15)}")
     log(f"[7/7 export] DONE. splat.ply was NOT modified.")
 
 
@@ -556,7 +712,7 @@ def stage_export(scene: str, inst_arr: np.ndarray, labels: dict) -> None:
 # Driver
 # ---------------------------------------------------------------------------
 
-STAGES = ("keyframes", "masks", "voters", "associate", "label", "lift", "export")
+STAGES = ("keyframes", "masks", "voters", "associate", "lift", "label", "export")
 
 
 def main() -> int:
@@ -569,8 +725,18 @@ def main() -> int:
                     help="A Gaussian is visible if z <= front_z * (1+tol).")
     ap.add_argument("--assoc-jaccard", type=float, default=0.20,
                     help="Min voter-set Jaccard to link two masks across views.")
-    ap.add_argument("--min-voters-per-instance", type=int, default=200,
-                    help="Drop instances with fewer total Gaussian voters than this.")
+    ap.add_argument("--label-views", type=int, default=3,
+                    help="Run Qwen on the top-K voter-count views per instance and take the majority label.")
+    ap.add_argument("--min-gaussians", type=int, default=20,
+                    help="After lift, skip instances with fewer Gaussians than this (no label, no anchor).")
+    ap.add_argument("--scatter-ratio", type=float, default=10.0,
+                    help="Drop instances whose p95 distance-to-centroid > ratio * median (= scattered/merged).")
+    ap.add_argument("--max-size-frac", type=float, default=0.25,
+                    help="Drop instances whose inlier diag exceeds this fraction of the scene diag.")
+    ap.add_argument("--dedup-factor", type=float, default=0.7,
+                    help="Merge same-label instances whose anchors are within factor * max(diag).")
+    ap.add_argument("--up-axis", choices=["+y", "-y", "+z", "-z"], default="+y",
+                    help="Scene up direction in splat coordinates.")
     ap.add_argument("--only", choices=STAGES)
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
@@ -590,16 +756,18 @@ def main() -> int:
     assoc = stage_associate(args.scene, voter_data, args.assoc_jaccard, args.force)
     if args.only == "associate": return 0
 
-    labels = stage_label(args.scene, kfs, voter_data, assoc,
-                         args.min_voters_per_instance, args.force)
+    inst_arr = stage_lift(args.scene, voter_data, assoc)
+    if args.only == "lift": return 0
+
+    labels = stage_label(args.scene, kfs, voter_data, assoc, inst_arr,
+                         args.min_gaussians, args.label_views, args.force)
     if args.only == "label": return 0
 
-    inst_arr = stage_lift(args.scene, voter_data, assoc, labels)
-    if args.only == "lift":
-        np.save(REPO / "semantics" / args.scene / "gaussian_instances.npy", inst_arr)
-        return 0
-
-    stage_export(args.scene, inst_arr, labels)
+    stage_export(args.scene, inst_arr, labels,
+                 scatter_ratio=args.scatter_ratio,
+                 max_size_frac=args.max_size_frac,
+                 dedup_factor=args.dedup_factor,
+                 up_axis=args.up_axis)
     return 0
 
 

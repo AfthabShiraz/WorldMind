@@ -1,0 +1,14 @@
+# Lightweight dependencies for the in-browser viewer ONLY.
+# Use this if you just want to view a .ply (your own or the bundled example
+# scene) without installing the full training stack.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements-viewer.txt
+#   make view-example
+#
+# These three are sufficient to load a splatfacto .ply, subsample its
+# centres, and serve viser's web frontend.
+
+viser>=0.2
+plyfile>=1.0
+numpy>=1.24
