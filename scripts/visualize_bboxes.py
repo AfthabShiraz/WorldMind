@@ -21,10 +21,39 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def load_dataparser_transform(scene: str) -> tuple[np.ndarray, float]:
+    runs = sorted((REPO / "outputs" / scene / "splatfacto_full" / "splatfacto").glob(
+        "*/dataparser_transforms.json"))
+    if not runs:
+        return np.eye(4, dtype=np.float64), 1.0
+    d = json.loads(runs[-1].read_text())
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :4] = np.asarray(d["transform"], dtype=np.float64)
+    return T, float(d["scale"])
+
+
+def project_world_to_pixel(xyz_world: np.ndarray, w2c: np.ndarray,
+                           fx: float, fy: float, cx: float, cy: float,
+                           W: int, H: int) -> tuple[float, float] | None:
+    """Mirror of place_object_labels.project_gaussians for a single world
+    point. Returns (u, v) in pixel coords or None if behind or off-frame."""
+    p_h = np.array([xyz_world[0], xyz_world[1], xyz_world[2], 1.0], dtype=np.float64)
+    p_cam = w2c @ p_h
+    Xc, Yc, Zc = p_cam[0], -p_cam[1], -p_cam[2]
+    if Zc <= 1e-3:
+        return None
+    u = fx * Xc / Zc + cx
+    v = fy * Yc / Zc + cy
+    if not (0 <= u < W and 0 <= v < H):
+        return None
+    return (float(u), float(v))
 
 
 # Reject reason -> RGB. None = accepted -> green.
@@ -86,6 +115,22 @@ def main() -> int:
     # Need source keyframe paths — read scene transforms.
     t = json.loads((REPO / "data" / "scenes" / args.scene / "transforms.json").read_text())
     file_by_idx = {i: f["file_path"] for i, f in enumerate(t["frames"])}
+    fx, fy = float(t["fl_x"]), float(t["fl_y"])
+    cx_i, cy_i = float(t["cx"]), float(t["cy"])
+    W_i, H_i = int(t["w"]), int(t["h"])
+    T_dp, s_dp = load_dataparser_transform(args.scene)
+
+    # Pre-build w2c per keyframe so we can project 3D anchors back into pixels.
+    w2c_by_idx: dict[int, np.ndarray] = {}
+    for i, f in enumerate(t["frames"]):
+        c2w_ns = np.array(f["transform_matrix"], dtype=np.float64)
+        c2w = T_dp @ c2w_ns
+        c2w[:3, 3] *= s_dp
+        w2c_by_idx[i] = np.linalg.inv(c2w)
+
+    # Collect every 3D anchor so we can mark "where this label LANDED in 3D"
+    # by projecting it back into every keyframe.
+    anchors = d.get("anchors", [])
 
     out_dir = REPO / "semantics" / args.scene / "bbox_audit"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -130,6 +175,33 @@ def main() -> int:
             )
             draw.text((x1, max(0, y1 - 26)), text, fill=(0, 0, 0), font=small_font)
 
+        # --- Project each 3D anchor back into THIS keyframe -----------------
+        # Each marker is a cyan crosshair + label at the pixel where the
+        # anchor's 3D position lands. Compare to the bbox center: if the
+        # cyan dot drifts off the object that owns that label, the 3D
+        # anchor is misplaced even though the bbox was right.
+        for a in anchors:
+            uv = project_world_to_pixel(np.array(a["anchor"]),
+                                        w2c_by_idx[kf_idx],
+                                        fx, fy, cx_i, cy_i, W_i, H_i)
+            if uv is None:
+                continue
+            u, v = uv
+            cross = 14
+            cyan = (0, 220, 255)
+            draw.line([(u - cross, v), (u + cross, v)], fill=cyan + (255,), width=3)
+            draw.line([(u, v - cross), (u, v + cross)], fill=cyan + (255,), width=3)
+            draw.ellipse([u - 6, v - 6, u + 6, v + 6],
+                         outline=cyan + (255,), width=3, fill=(0, 0, 0, 0))
+            tag = a["label"]
+            if a.get("n_clusters", 1) > 1:
+                tag = f"{tag} {a['cluster_idx'] + 1}/{a['n_clusters']}"
+            tag = f"◇ {tag}"
+            tb = draw.textbbox((u + 10, v - 10), tag, font=small_font)
+            draw.rectangle([tb[0] - 3, tb[1] - 3, tb[2] + 3, tb[3] + 3],
+                           fill=(0, 0, 0, 200))
+            draw.text((u + 10, v - 10), tag, fill=cyan, font=small_font)
+
         # Legend strip at top-left.
         legend_y = 10
         legend_items = [
@@ -137,6 +209,7 @@ def main() -> int:
             ("rejected: bbox over void", COLOR["sparse_patch"]),
             ("rejected: too far away", COLOR["too_far"]),
             ("rejected: outside room AABB", COLOR["outside_aabb"]),
+            ("◇  projected 3D anchor location", (0, 220, 255)),
         ]
         legend_w = 380
         legend_h = 24 * len(legend_items) + 10

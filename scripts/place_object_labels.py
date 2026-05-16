@@ -50,6 +50,26 @@ REPO = Path(__file__).resolve().parent.parent
 QWEN_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 
+# Whitelist of "significant" room features worth labelling in 3D.
+# Override on the command line with --objects "chair,desk,...".
+SIGNIFICANT_OBJECTS = {
+    # Furniture you sit / sleep / work on
+    "bed", "chair", "armchair", "stool", "sofa", "couch", "bench",
+    # Surfaces
+    "desk", "table", "nightstand", "dresser",
+    # Storage
+    "wardrobe", "cabinet", "shelf", "bookshelf", "drawer",
+    # Architectural
+    "window", "door", "curtain", "blind", "mirror",
+    # Fixtures / appliances
+    "radiator", "heater", "fireplace", "tv", "monitor", "fan",
+    # Floor coverings
+    "rug", "carpet",
+    # Plant / decoration
+    "plant",
+}
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
@@ -107,13 +127,76 @@ def build_depth_and_density(ui: np.ndarray, vi: np.ndarray, z: np.ndarray,
 
 def back_project(c2w: np.ndarray, u_px: float, v_px: float, depth: float,
                  fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
-    """Pixel + camera-space depth -> world XYZ. Nerfstudio (OpenGL) convention."""
+    """Pixel + camera-space depth -> world XYZ. Nerfstudio (OpenGL) convention.
+    Used only as a fallback / sanity check; final anchor comes from ray
+    triangulation."""
     Xc = (u_px - cx) * depth / fx
     Yc = (v_px - cy) * depth / fy
     Zc = depth
-    # OpenCV -> OpenGL/nerfstudio: flip y, z.
     p_cam = np.array([Xc, -Yc, -Zc, 1.0], dtype=np.float64)
     return (c2w @ p_cam)[:3]
+
+
+def pixel_to_ray(c2w: np.ndarray, u_px: float, v_px: float,
+                 fx: float, fy: float, cx: float, cy: float
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """Return (origin_world, direction_world_unit) for a ray through pixel."""
+    # Camera-space direction in OpenCV, then flip y,z for OpenGL/nerfstudio.
+    d_cam = np.array([(u_px - cx) / fx,
+                      -(v_px - cy) / fy,
+                      -1.0], dtype=np.float64)
+    d_cam /= np.linalg.norm(d_cam)
+    d_world = c2w[:3, :3] @ d_cam
+    d_world /= np.linalg.norm(d_world)
+    return c2w[:3, 3].astype(np.float64), d_world
+
+
+def triangulate_robust(origins: np.ndarray, dirs: np.ndarray,
+                       max_iter: int = 4
+                       ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """Find 3D point minimising weighted sum-of-squared distances to a set of
+    rays, with iteratively-reweighted Cauchy weights to suppress outlier
+    rays. Returns (point | None if degenerate, inlier_mask, per-ray residual).
+
+    For each ray r_i = c_i + t d_i (d_i unit), the squared distance from a
+    point P to r_i is (P - c_i)^T (I - d_i d_i^T) (P - c_i). Summing,
+    differentiating, setting to zero gives the 3x3 linear system
+        [ Σ w_i (I - d_i d_i^T) ] P  =  Σ w_i (I - d_i d_i^T) c_i .
+    """
+    N = origins.shape[0]
+    if N < 2:
+        return None, np.zeros(N, dtype=bool), np.full(N, np.inf)
+    weights = np.ones(N, dtype=np.float64)
+    P = np.zeros(3, dtype=np.float64)
+    dists = np.full(N, np.inf, dtype=np.float64)
+    for _ in range(max_iter):
+        A = np.zeros((3, 3), dtype=np.float64)
+        b = np.zeros(3, dtype=np.float64)
+        for i in range(N):
+            if weights[i] < 1e-3:
+                continue
+            d = dirs[i]
+            M = (np.eye(3) - np.outer(d, d)) * weights[i]
+            A += M
+            b += M @ origins[i]
+        try:
+            P_new = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return None, weights > 0.5, dists
+        # Distance from P to each ray
+        diffs = P_new - origins
+        proj = (diffs * dirs).sum(axis=1)
+        closest = origins + proj[:, None] * dirs
+        dists = np.linalg.norm(P_new - closest, axis=1)
+        # Reject rays whose ray-parameter is negative (point behind the camera).
+        behind = proj < 0
+        dists[behind] = np.inf
+        sigma = max(0.05, float(np.median(dists[np.isfinite(dists)])))
+        weights = 1.0 / (1.0 + (dists / sigma) ** 2)
+        weights[behind] = 0.0
+        P = P_new
+    inliers = weights > 0.5
+    return P, inliers, dists
 
 
 # ---------------------------------------------------------------------------
@@ -189,23 +272,38 @@ def pick_keyframes(scene: str, n: int) -> list[dict]:
     return [{"idx": int(i), **frames[int(i)]} for i in idxs]
 
 
-def load_inventory(scene: str, min_frames: int) -> list[str]:
+def load_inventory(scene: str, min_frames: int,
+                   override_objects: list[str] | None,
+                   use_all: bool) -> list[str]:
     p = REPO / "semantics" / scene / "scene_inventory.json"
     if not p.exists():
         log(f"ERROR: no scene_inventory.json — run `make scene-inventory SCENE={scene}` first")
         return []
     inv = json.loads(p.read_text())
-    # Apply user threshold to the per-object counts, OR auto-default to ~1/3
-    # of keyframes (matches the viewer's default).
     nk = int(inv.get("n_keyframes", 1))
     if min_frames <= 0:
         min_frames = max(2, nk // 3)
-    keep = [name for name, c in inv["counts"] if int(c) >= min_frames]
-    # Filter out non-physical "objects" that the VLM sometimes lists.
-    SKIP = {"wall", "floor", "ceiling", "room", "scene", "background", "view"}
-    keep = [k for k in keep if k not in SKIP]
-    log(f"inventory: {len(keep)} strongly-seen objects (>= {min_frames} frames) "
-        f"after dropping non-physical surfaces")
+    strongly_seen = [name for name, c in inv["counts"] if int(c) >= min_frames]
+
+    if override_objects:
+        # User passed --objects "chair,desk,bed,..." — use exactly that list,
+        # but warn about any names that aren't in the inventory at all.
+        keep = list(override_objects)
+        missing = [o for o in keep if o not in {n for n, _ in inv["counts"]}]
+        if missing:
+            log(f"  WARN: {missing} not in inventory; will still try them")
+    elif use_all:
+        SKIP = {"wall", "floor", "ceiling", "room", "scene", "background", "view"}
+        keep = [k for k in strongly_seen if k not in SKIP]
+    else:
+        keep = [k for k in strongly_seen if k in SIGNIFICANT_OBJECTS]
+        log(f"  significant-object whitelist: {sorted(SIGNIFICANT_OBJECTS)}")
+        skipped = [k for k in strongly_seen
+                   if k not in SIGNIFICANT_OBJECTS
+                   and k not in {"wall", "floor", "ceiling"}]
+        if skipped:
+            log(f"  skipping (not in whitelist): {skipped}")
+    log(f"inventory: {len(keep)} object(s) to label: {keep}")
     return keep
 
 
@@ -223,14 +321,24 @@ def main() -> int:
                     help="Min projected-Gaussian count inside patch to trust the depth.")
     ap.add_argument("--max-depth-frac", type=float, default=0.6,
                     help="Reject back-projections at depth > frac * scene diagonal.")
-    ap.add_argument("--cluster-eps", type=float, default=0.4,
-                    help="DBSCAN epsilon in splat units. Tune per scene scale.")
     ap.add_argument("--min-views-per-anchor", type=int, default=3,
-                    help="DBSCAN min_samples — anchor needs this many views.")
+                    help="Minimum kept views (after triangulation outlier rejection) "
+                         "required to keep an anchor.")
+    ap.add_argument("--objects",
+                    help="Comma-separated list of objects to label, overriding "
+                         "the SIGNIFICANT_OBJECTS whitelist. E.g. 'chair,desk,bed'.")
+    ap.add_argument("--all-from-inventory", action="store_true",
+                    help="Use every strongly-seen object from scene_inventory.json "
+                         "(skip the SIGNIFICANT_OBJECTS whitelist).")
+    ap.add_argument("--max-residual", type=float, default=0.6,
+                    help="Drop anchors whose median ray-residual after "
+                         "triangulation exceeds this (splat units).")
     ap.add_argument("--show-raw", action="store_true",
                     help="Print Qwen's raw bbox response per (object, keyframe).")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
+    override_objects = ([o.strip() for o in args.objects.split(",") if o.strip()]
+                        if args.objects else None)
 
     out_dir = REPO / "semantics" / args.scene
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -239,7 +347,8 @@ def main() -> int:
         log(f"cached: {out_path} (use --force to redo)")
         return 0
 
-    objects = load_inventory(args.scene, args.min_frames)
+    objects = load_inventory(args.scene, args.min_frames,
+                             override_objects, args.all_from_inventory)
     if not objects:
         return 2
     kfs = pick_keyframes(args.scene, args.n_keyframes)
@@ -285,7 +394,9 @@ def main() -> int:
         QWEN_ID, torch_dtype=torch.bfloat16, device_map="cuda"
     ).eval()
 
-    # detections[obj] -> list of (kf_idx, xyz_world, reject_reason or None)
+    # detections[obj] -> list of per-keyframe entries (passed or rejected).
+    # For accepted entries we record the ray (origin + dir) so triangulation
+    # can solve across views afterwards.
     detections: dict[str, list[dict]] = defaultdict(list)
     n_calls = 0
     half = args.patch // 2
@@ -298,22 +409,22 @@ def main() -> int:
             n_calls += 1
             box = parse_bbox(raw, W, H)
             entry = {"kf": k["idx"], "raw": raw.strip(), "bbox": box,
-                     "reject": None, "xyz": None}
+                     "reject": None, "xyz": None, "ray_origin": None,
+                     "ray_dir": None}
             if box is None:
                 entry["reject"] = "no_box"
                 detections[obj].append(entry)
-                if args.show_raw:
-                    log(f"[{obj}/kf{k['idx']:04d}] no box  raw={raw.strip()!r}")
                 continue
             x1, y1, x2, y2 = box
             u_px = (x1 + x2) // 2
             v_px = (y1 + y2) // 2
             entry["center_px"] = [int(u_px), int(v_px)]
 
-            # Safety 1: local density
+            # Safety 1: local Gaussian density — bbox centre must be over
+            # actual scene geometry, not a void (window-through, hole, sky).
             yy0 = max(0, v_px - half); yy1 = min(H, v_px + half + 1)
             xx0 = max(0, u_px - half); xx1 = min(W, u_px + half + 1)
-            density_patch = cache["density"][yy0:yy1, xx0:xx1].sum()
+            density_patch = int(cache["density"][yy0:yy1, xx0:xx1].sum())
             if density_patch < args.min_density:
                 entry["reject"] = f"sparse_patch({density_patch})"
                 detections[obj].append(entry)
@@ -324,73 +435,85 @@ def main() -> int:
                 entry["reject"] = "no_finite_depth"
                 detections[obj].append(entry)
                 continue
-            d = float(np.median(valid_depths))   # median over patch is robust
+            d = float(np.median(valid_depths))
 
-            # Safety 2: scene-relative depth cap
+            # Safety 2: scene-relative depth cap (no far floaters).
             if d > max_depth:
                 entry["reject"] = f"too_far({d:.2f}>{max_depth:.2f})"
                 detections[obj].append(entry)
                 continue
 
-            # Back-project
-            xyz_w = back_project(cache["c2w"], u_px, v_px, d, fx, fy, cx, cy)
-            entry["xyz"] = xyz_w.tolist()
-            entry["depth"] = d
-
-            # Safety 3: must land inside the scene AABB
-            if not (np.all(xyz_w >= scene_lo - 0.1 * scene_diag) and
-                    np.all(xyz_w <= scene_hi + 0.1 * scene_diag)):
-                entry["reject"] = "outside_aabb"
-                detections[obj].append(entry)
-                continue
-
+            # Compute the ray for this detection. Final 3D anchor comes from
+            # triangulation across all accepted rays of this object, NOT this
+            # single view's depth-based back-projection (which was the root
+            # cause of labels landing on whatever surface the bbox centre
+            # happened to hit).
+            origin, direction = pixel_to_ray(cache["c2w"], u_px, v_px,
+                                             fx, fy, cx, cy)
+            entry["ray_origin"] = origin.tolist()
+            entry["ray_dir"] = direction.tolist()
+            entry["depth_proxy"] = d
+            # Keep the proxy back-projection for the audit visualizer / debug.
+            entry["xyz"] = back_project(cache["c2w"], u_px, v_px, d,
+                                        fx, fy, cx, cy).tolist()
             detections[obj].append(entry)
             if args.show_raw:
-                log(f"[{obj}/kf{k['idx']:04d}] OK  px=({u_px},{v_px}) d={d:.2f} "
-                    f"xyz=({xyz_w[0]:+.2f},{xyz_w[1]:+.2f},{xyz_w[2]:+.2f})")
+                log(f"[{obj}/kf{k['idx']:04d}] OK  px=({u_px},{v_px}) d≈{d:.2f}")
 
     del model, proc
     torch.cuda.empty_cache()
 
-    # ---- Cluster surviving detections per object --------------------------
-    from sklearn.cluster import DBSCAN
-
+    # ---- Per-object triangulation across kept rays ------------------------
     anchors_out: list[dict] = []
     summary: list[str] = []
     for obj, entries in detections.items():
-        survivors = [e for e in entries if e["reject"] is None and e["xyz"] is not None]
-        pts = np.array([e["xyz"] for e in survivors], dtype=np.float64)
-        rejects = len(entries) - len(survivors)
+        accepted = [e for e in entries if e["reject"] is None
+                    and e["ray_origin"] is not None]
+        rejects = len(entries) - len(accepted)
         reject_reasons = defaultdict(int)
         for e in entries:
             if e["reject"]:
                 reject_reasons[e["reject"].split("(")[0]] += 1
-        if pts.shape[0] < args.min_views_per_anchor:
-            summary.append(f"  {obj:<14}  views={pts.shape[0]:>2} rejects={rejects:>2} "
+        if len(accepted) < args.min_views_per_anchor:
+            summary.append(f"  {obj:<14}  views={len(accepted):>2} rejects={rejects:>2} "
                            f"-> DROPPED (need >={args.min_views_per_anchor})")
             continue
-        labels = DBSCAN(eps=args.cluster_eps,
-                        min_samples=args.min_views_per_anchor).fit_predict(pts)
-        clusters: dict[int, list[int]] = defaultdict(list)
-        for i, lab in enumerate(labels):
-            if lab >= 0:
-                clusters[int(lab)].append(i)
-        if not clusters:
-            summary.append(f"  {obj:<14}  views={pts.shape[0]:>2} rejects={rejects:>2} "
-                           f"-> no cluster (points too scattered)")
+
+        origins = np.array([e["ray_origin"] for e in accepted], dtype=np.float64)
+        dirs = np.array([e["ray_dir"] for e in accepted], dtype=np.float64)
+        anchor, inliers, dists = triangulate_robust(origins, dirs)
+        if anchor is None:
+            summary.append(f"  {obj:<14}  -> degenerate (rays parallel)")
             continue
-        for cidx, idxs in sorted(clusters.items()):
-            cpts = pts[idxs]
-            anchor = cpts.mean(axis=0)
-            anchors_out.append({
-                "label": obj,
-                "anchor": [float(anchor[0]), float(anchor[1]), float(anchor[2])],
-                "n_views": len(idxs),
-                "n_clusters": len(clusters),
-                "cluster_idx": cidx,
-            })
-        summary.append(f"  {obj:<14}  views={pts.shape[0]:>2} rejects={rejects:>2} "
-                       f"clusters={len(clusters)} ({dict(reject_reasons)})")
+        n_in = int(inliers.sum())
+        med_resid = float(np.median(dists[inliers])) if n_in else float("inf")
+
+        # Final sanity: anchor must land inside the scene AABB.
+        if not (np.all(anchor >= scene_lo - 0.1 * scene_diag) and
+                np.all(anchor <= scene_hi + 0.1 * scene_diag)):
+            summary.append(f"  {obj:<14}  rays={len(accepted)} inliers={n_in} "
+                           f"med_resid={med_resid:.2f} -> anchor OUTSIDE AABB, dropped")
+            continue
+        if med_resid > args.max_residual:
+            summary.append(f"  {obj:<14}  rays={len(accepted)} inliers={n_in} "
+                           f"med_resid={med_resid:.2f} > {args.max_residual} -> too wobbly, dropped")
+            continue
+        if n_in < args.min_views_per_anchor:
+            summary.append(f"  {obj:<14}  rays={len(accepted)} inliers={n_in} "
+                           f"-> too few inlier rays, dropped")
+            continue
+
+        anchors_out.append({
+            "label": obj,
+            "anchor": [float(anchor[0]), float(anchor[1]), float(anchor[2])],
+            "n_views": n_in,
+            "n_rays": len(accepted),
+            "med_residual": med_resid,
+            "n_clusters": 1,
+            "cluster_idx": 0,
+        })
+        summary.append(f"  {obj:<14}  rays={len(accepted):>2} inliers={n_in:>2} "
+                       f"resid={med_resid:.2f}  rejects={dict(reject_reasons)}")
 
     log(f"Qwen calls: {n_calls}; anchors produced: {len(anchors_out)}")
     log("per-object breakdown (rejects in parentheses):")
@@ -401,18 +524,22 @@ def main() -> int:
         "scene": args.scene,
         "n_keyframes": len(kfs),
         "min_frames": args.min_frames,
+        "method": "ray-triangulation",
         "params": {
             "patch": args.patch,
             "min_density": args.min_density,
             "max_depth_frac": args.max_depth_frac,
-            "cluster_eps": args.cluster_eps,
+            "max_residual": args.max_residual,
             "min_views_per_anchor": args.min_views_per_anchor,
+            "objects_filter": ("override" if override_objects
+                               else "all_inventory" if args.all_from_inventory
+                               else "significant_whitelist"),
         },
         "scene_aabb_lo": scene_lo.tolist(),
         "scene_aabb_hi": scene_hi.tolist(),
         "scene_diag": scene_diag,
         "anchors": anchors_out,
-        "detections": {k: v for k, v in detections.items()},  # for debugging
+        "detections": {k: v for k, v in detections.items()},
     }, indent=2))
     log(f"wrote {out_path}")
     return 0
