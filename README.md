@@ -4,6 +4,8 @@ Drop in a phone-shot video of a room, get back a trained 3D Gaussian splat
 you can open in a web viewer or drop into [PlayCanvas SuperSplat](https://playcanvas.com/supersplat).
 No manual frame extraction, no COLMAP wrestling, no Nerfstudio CLI to learn.
 
+![Example scene rendered from the trained splat — bedroom-with-workspace `room5`](splatscreenshot.png)
+
 ```
 video.mp4
    ↓  make run VIDEO=video.mp4
